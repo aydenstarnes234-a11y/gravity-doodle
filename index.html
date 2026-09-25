@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Gravity Doodle</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: rgba(255,255,255,0.06);
+    --panel-border: rgba(255,255,255,0.12);
+    --text: #e8e8ee;
+    --accent: #7c5cff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: var(--bg);
+    height: 100%;
+    width: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--text);
+  }
+  #world {
+    position: fixed;
+    inset: 0;
+    display: block;
+    cursor: crosshair;
+    touch-action: none;
+  }
+  #toolbar {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    z-index: 10;
+    user-select: none;
+  }
+  #toolbar button, #toolbar label {
+    font-size: 13px;
+    color: var(--text);
+  }
+  #toolbar button {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 7px 12px;
+    border-radius: 9px;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  #toolbar button:hover { background: rgba(255,255,255,0.16); }
+  #toolbar button.active { background: var(--accent); border-color: var(--accent); }
+  .swatches { display: flex; gap: 6px; }
+  .swatch {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.3);
+    cursor: pointer;
+  }
+  .swatch.selected { border-color: #fff; transform: scale(1.15); }
+  #brush {
+    width: 80px;
+  }
+  #hint {
+    position: fixed;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 12px;
+    color: rgba(255,255,255,0.45);
+    z-index: 10;
+    text-align: center;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="world"></canvas>
+
+<div id="toolbar">
+  <div class="swatches" id="swatches"></div>
+  <label>brush <input type="range" id="brush" min="4" max="26" value="10"></label>
+  <button id="gravityBtn">flip gravity</button>
+  <button id="clearBtn">clear</button>
+</div>
+<div id="hint">draw a shape and let go — it'll fall. drag pieces around anytime.</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+(function () {
+  const { Engine, Render, Runner, World, Bodies, Body, Composite, Mouse, MouseConstraint, Vector, Events } = Matter;
+
+  const canvas = document.getElementById('world');
+  const ctx = canvas.getContext('2d');
+
+  let W = window.innerWidth;
+  let H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+
+  // ---- physics setup ----
+  const engine = Engine.create();
+  const world = engine.world;
+  world.gravity.y = 1;
+
+  let walls = [];
+  function buildWalls() {
+    Composite.remove(world, walls);
+    const t = 60;
+    walls = [
+      Bodies.rectangle(W / 2, H + t / 2, W + t * 2, t, { isStatic: true }),
+      Bodies.rectangle(W / 2, -t / 2, W + t * 2, t, { isStatic: true }),
+      Bodies.rectangle(-t / 2, H / 2, t, H + t * 2, { isStatic: true }),
+      Bodies.rectangle(W + t / 2, H / 2, t, H + t * 2, { isStatic: true }),
+    ];
+    Composite.add(world, walls);
+  }
+  buildWalls();
+
+  const runner = Runner.create();
+  Runner.run(runner, engine);
+
+  // ---- mouse dragging of existing bodies ----
+  const mouse = Mouse.create(canvas);
+  mouse.pixelRatio = 1;
+  const mouseConstraint = MouseConstraint.create(engine, {
+    mouse: mouse,
+    constraint: { stiffness: 0.2, render: { visible: false } }
+  });
+  Composite.add(world, mouseConstraint);
+
+  // ---- color palette ----
+  const palette = ['#7c5cff', '#ff5c8a', '#5cd6ff', '#ffd15c', '#5cff8a', '#ffffff'];
+  let currentColor = palette[0];
+
+  const swatchesEl = document.getElementById('swatches');
+  palette.forEach((c, i) => {
+    const s = document.createElement('div');
+    s.className = 'swatch' + (i === 0 ? ' selected' : '');
+    s.style.background = c;
+    s.addEventListener('click', () => {
+      currentColor = c;
+      document.querySelectorAll('.swatch').forEach(el => el.classList.remove('selected'));
+      s.classList.add('selected');
+    });
+    swatchesEl.appendChild(s);
+  });
+
+  const brushInput = document.getElementById('brush');
+
+  // ---- drawing state ----
+  let drawing = false;
+  let strokePoints = [];
+  const bodyMeta = new Map(); // body.id -> {color}
+
+  function getPos(evt) {
+    const rect = canvas.getBoundingClientRect();
+    const t = evt.touches ? evt.touches[0] : evt;
+    return { x: t.clientX - rect.left, y: t.clientY - rect.top };
+  }
+
+  function isOverToolbar(evt) {
+    const t = evt.touches ? evt.touches[0] : evt;
+    const el = document.elementFromPoint(t.clientX, t.clientY);
+    return el && el.closest('#toolbar');
+  }
+
+  function startDraw(evt) {
+    if (isOverToolbar(evt)) return;
+    // don't start a new doodle if we grabbed an existing body
+    if (mouseConstraint.body) return;
+    drawing = true;
+    strokePoints = [getPos(evt)];
+  }
+
+  function moveDraw(evt) {
+    if (!drawing) return;
+    const p = getPos(evt);
+    const last = strokePoints[strokePoints.length - 1];
+    if (Vector.magnitude(Vector.sub(p, last)) > 3) {
+      strokePoints.push(p);
+    }
+  }
+
+  function endDraw() {
+    if (!drawing) return;
+    drawing = false;
+    finalizeStroke(strokePoints);
+    strokePoints = [];
+  }
+
+  function finalizeStroke(points) {
+    if (points.length < 2) return;
+
+    const brush = parseFloat(brushInput.value);
+
+    // Very short tap/dot -> circle
+    let length = 0;
+    for (let i = 1; i < points.length; i++) length += Vector.magnitude(Vector.sub(points[i], points[i - 1]));
+
+    let body;
+    if (points.length < 4 || length < 14) {
+      const c = points[points.length - 1];
+      body = Bodies.circle(c.x, c.y, Math.max(brush, 10), {
+        restitution: 0.5, friction: 0.4, frictionAir: 0.001
+      });
+    } else {
+      // Build a closed polygon by offsetting the stroke path into a ribbon
+      const verts = buildRibbon(points, Math.max(brush * 0.5, 4));
+      const centre = verts.reduce((acc, v) => ({ x: acc.x + v.x / verts.length, y: acc.y + v.y / verts.length }), { x: 0, y: 0 });
+      try {
+        body = Bodies.fromVertices(centre.x, centre.y, [verts], {
+          restitution: 0.5, friction: 0.4, frictionAir: 0.001
+        }, true);
+        if (!body) throw new Error('fallback');
+      } catch (e) {
+        body = Bodies.circle(centre.x, centre.y, Math.max(brush, 12), { restitution: 0.5, friction: 0.4 });
+      }
+    }
+
+    bodyMeta.set(body.id, { color: currentColor });
+    Body.setVelocity(body, { x: 0, y: 0 });
+    Composite.add(world, body);
+  }
+
+  // turn a stroke polyline into a thin closed polygon (ribbon) around it
+  function buildRibbon(points, halfWidth) {
+    const left = [];
+    const right = [];
+    for (let i = 0; i < points.length; i++) {
+      const prev = points[Math.max(0, i - 1)];
+      const next = points[Math.min(points.length - 1, i + 1)];
+      const dir = Vector.normalise(Vector.sub(next, prev));
+      const normal = { x: -dir.y, y: dir.x };
+      if (isFinite(normal.x) && isFinite(normal.y)) {
+        left.push({ x: points[i].x + normal.x * halfWidth, y: points[i].y + normal.y * halfWidth });
+        right.push({ x: points[i].x - normal.x * halfWidth, y: points[i].y - normal.y * halfWidth });
+      } else {
+        left.push(points[i]);
+        right.push(points[i]);
+      }
+    }
+    return left.concat(right.reverse());
+  }
+
+  canvas.addEventListener('mousedown', startDraw);
+  canvas.addEventListener('mousemove', moveDraw);
+  window.addEventListener('mouseup', endDraw);
+  canvas.addEventListener('touchstart', (e) => { startDraw(e); }, { passive: true });
+  canvas.addEventListener('touchmove', (e) => { moveDraw(e); }, { passive: true });
+  canvas.addEventListener('touchend', endDraw);
+
+  // ---- gravity flip ----
+  document.getElementById('gravityBtn').addEventListener('click', () => {
+    world.gravity.y *= -1;
+  });
+
+  // ---- clear ----
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    const bodies = Composite.allBodies(world).filter(b => !b.isStatic);
+    Composite.remove(world, bodies);
+    bodyMeta.clear();
+  });
+
+  // ---- resize ----
+  window.addEventListener('resize', () => {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    buildWalls();
+  });
+
+  // ---- render loop (custom, so we can color each body & draw live stroke) ----
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+
+    // subtle grid background
+    ctx.fillStyle = '#0f1117';
+    ctx.fillRect(0, 0, W, H);
+
+    const bodies = Composite.allBodies(world);
+    for (const body of bodies) {
+      if (body.isStatic) continue;
+      const meta = bodyMeta.get(body.id);
+      const color = meta ? meta.color : '#7c5cff';
+      const verts = body.vertices;
+      ctx.beginPath();
+      ctx.moveTo(verts[0].x, verts[0].y);
+      for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.9;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.stroke();
+    }
+
+    // live stroke preview
+    if (drawing && strokePoints.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(strokePoints[0].x, strokePoints[0].y);
+      for (let i = 1; i < strokePoints.length; i++) ctx.lineTo(strokePoints[i].x, strokePoints[i].y);
+      ctx.strokeStyle = currentColor;
+      ctx.lineWidth = parseFloat(brushInput.value);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.globalAlpha = 0.85;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    requestAnimationFrame(render);
+  }
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
